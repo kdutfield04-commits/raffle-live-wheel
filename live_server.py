@@ -134,24 +134,43 @@ def start_draw(data: DrawStart, authorization: str | None = Header(default=None)
 @app.post("/api/draw/complete")
 def complete_draw(data: DrawComplete, authorization: str | None = Header(default=None)):
     require_key(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    cleared_current_wheel = False
     with db() as c:
         row = c.execute("SELECT payload FROM draws WHERE raffle_id=?", (data.raffle_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Draw not found")
         c.execute("UPDATE draws SET status='COMPLETED', updated_at=? WHERE raffle_id=?",
-                  (datetime.now(timezone.utc).isoformat(), data.raffle_id))
-    # Once the reveal is finished, clear the public display ready for the next raffle.
-    save_live_state({
-        "status": "WAITING",
-        "raffle_id": None,
-        "last_completed_raffle_id": data.raffle_id,
-        "prize": "",
-        "ticket_limit": 30,
-        "winner_count": 0,
-        "start_at": None,
-        "winners": [],
-    })
-    return {"ok": True, "raffle_id": data.raffle_id, "status": "WAITING"}
+                  (now, data.raffle_id))
+
+        # Only clear the public wheel if it is STILL showing this exact raffle.
+        # A late completion callback from raffle 1 must never wipe raffle 2's READY/SPINNING state.
+        live_row = c.execute("SELECT payload FROM live_state WHERE id=1").fetchone()
+        if live_row:
+            live_payload = json.loads(live_row["payload"])
+            if live_payload.get("raffle_id") == data.raffle_id:
+                waiting_payload = {
+                    "status": "WAITING",
+                    "raffle_id": None,
+                    "last_completed_raffle_id": data.raffle_id,
+                    "prize": "",
+                    "ticket_limit": 30,
+                    "winner_count": 0,
+                    "start_at": None,
+                    "winners": [],
+                }
+                c.execute(
+                    "UPDATE live_state SET payload=?,updated_at=? WHERE id=1",
+                    (json.dumps(waiting_payload), now)
+                )
+                cleared_current_wheel = True
+
+    # If a newer raffle is already active, leave it untouched.
+    return {
+        "ok": True,
+        "raffle_id": data.raffle_id,
+        "status": "WAITING" if cleared_current_wheel else "UNCHANGED_NEWER_RAFFLE",
+    }
 
 @app.get("/api/draw/{raffle_id}")
 def get_draw(raffle_id: int):
